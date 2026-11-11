@@ -1,0 +1,196 @@
+
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: tinyphotos-windows-x64
+
+          - name: macOS Apple Silicon
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            artifact: tinyphotos-macos-arm64
+
+          - name: macOS Intel
+            runner: macos-26-intel
+            target: x86_64-apple-darwin
+            artifact: tinyphotos-macos-x64
+
+          - name: Linux x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: tinyphotos-linux-x64
+
+          - name: Linux ARM64
+            runner: ubuntu-26.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: tinyphotos-linux-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            cmake \
+            pkg-config \
+            libfontconfig-dev \
+            libfreetype-dev \
+            libglib2.0-dev \
+            libssl-dev \
+            libwayland-dev \
+            libwebkit2gtk-4.1-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libzstd-dev \
+            libvulkan-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Ensure lockfile
+        shell: bash
+        run: |
+          if [ ! -f Cargo.lock ]; then
+            cargo generate-lockfile
+          fi
+
+      - name: Check formatting
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: >-
+          cargo clippy
+          --locked
+          --all-targets
+          --target ${{ matrix.target }}
+          -- -D warnings
+
+      - name: Test
+        run: >-
+          cargo test
+          --locked
+          --all-targets
+          --target ${{ matrix.target }}
+
+      - name: Build release
+        run: >-
+          cargo build
+          --locked
+          --release
+          --target ${{ matrix.target }}
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+
+          Copy-Item "target/${{ matrix.target }}/release/tinyphotos.exe" dist/
+          Copy-Item README.md, LICENSE dist/
+
+          Compress-Archive `
+            -Path dist/* `
+            -DestinationPath "${{ matrix.artifact }}.zip" `
+            -CompressionLevel Optimal
+
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p dist
+          bundle="dist/TinyPhotos.app/Contents"
+          mkdir -p "$bundle/MacOS" "$bundle/Resources" "$RUNNER_TEMP/TinyPhotos.iconset"
+          cp "target/${{ matrix.target }}/release/tinyphotos" "$bundle/MacOS/"
+          for size in 16 32 128 256 512; do
+            sips -z "$size" "$size" assets/tinyphotos.png --out "$RUNNER_TEMP/TinyPhotos.iconset/icon_${size}x${size}.png" >/dev/null
+            double=$((size * 2))
+            sips -z "$double" "$double" assets/tinyphotos.png --out "$RUNNER_TEMP/TinyPhotos.iconset/icon_${size}x${size}@2x.png" >/dev/null
+          done
+          iconutil -c icns "$RUNNER_TEMP/TinyPhotos.iconset" -o "$bundle/Resources/tinyphotos.icns"
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          cat > "$bundle/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>TinyPhotos</string>
+            <key>CFBundleIdentifier</key><string>app.tinyphotos.desktop</string>
+            <key>CFBundleExecutable</key><string>tinyphotos</string>
+            <key>CFBundleIconFile</key><string>tinyphotos</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$version</string>
+            <key>CFBundleVersion</key><string>$version</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict></plist>
+          EOF
+          cp README.md LICENSE dist/
+          tar -czf "${{ matrix.artifact }}.tar.gz" -C dist .
+
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p dist/bin dist/share/applications dist/share/icons/hicolor/scalable/apps
+          cp "target/${{ matrix.target }}/release/tinyphotos" dist/bin/
+          cp assets/tinyphotos.desktop dist/share/applications/
+          cp assets/tinyphotos.svg dist/share/icons/hicolor/scalable/apps/
+          cp README.md LICENSE dist/
+          tar -czf "${{ matrix.artifact }}.tar.gz" -C dist .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

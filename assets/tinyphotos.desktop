@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=TinyPhotos
+Comment=Google Photos 原图备份
+Exec=tinyphotos
+Icon=tinyphotos
+Terminal=false
+Categories=Graphics;Photography;
+StartupWMClass=tinyphotos

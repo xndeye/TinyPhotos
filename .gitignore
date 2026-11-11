@@ -1,0 +1,14 @@
+/target/
+/.idea/
+/.vscode/
+*.exe
+*.pdb
+*.zip
+**/*.rs.bk
+rustc-ice-*.txt
+**/mutants.out*/
+# Never commit authentication material
+*.credential
+*credentials*.txt
+auth.txt
+.env
