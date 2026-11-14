@@ -1,10 +1,12 @@
 use super::*;
+use gpui_kit::base::actions::{Cancel, Confirm, SelectDown, SelectUp};
 use gpui_kit::component::{
     IconName, Side, Sizable,
     alert::Alert,
     input::Input,
     menu::{DropdownMenu, PopupMenuItem},
 };
+use std::rc::Rc;
 
 impl UploadApp {
     pub(super) fn settings_menu(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
@@ -84,13 +86,22 @@ impl UploadApp {
             .into_any_element()
     }
 
-    pub(super) fn account_menu(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    pub(super) fn account_menu(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         let accounts = self.account.index.emails.clone();
         let active = self.account.index.active.clone();
         let busy = self.busy();
         let view = cx.entity();
+        let focus = window
+            .use_keyed_state("account-menu-focus", cx, |_, cx| cx.focus_handle())
+            .read(cx)
+            .clone();
 
         Button::new("account")
+            .track_focus(&focus)
             .ghost()
             .small()
             .label(active.clone().unwrap_or_else(|| "选择账号".into()))
@@ -98,8 +109,10 @@ impl UploadApp {
             .max_w(px(260.0))
             .tooltip(active.clone().unwrap_or_else(|| "选择账号".into()))
             .disabled(busy)
-            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopLeft, move |menu, window, _cx| {
+            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopLeft, move |menu, window, cx| {
+                let menu_focus = menu.focus_handle(cx);
                 let mut menu = menu
+                    .action_context(focus.clone())
                     .min_w(px(250.0))
                     .max_h(px(340.0))
                     .scrollable(true)
@@ -111,27 +124,87 @@ impl UploadApp {
                 for email in &accounts {
                     let selected = active.as_deref() == Some(email.as_str());
                     let email_for_select = email.clone();
+                    let email = email.clone();
+                    let view_for_remove = view.clone();
+                    let focus_for_remove = focus.clone();
+                    let menu_focus = menu_focus.clone();
                     menu = menu.item(
-                        PopupMenuItem::new(email.clone())
-                            .checked(selected)
-                            .disabled(busy)
-                            .on_click(window.listener_for(&view, move |app, _, window, cx| {
+                        PopupMenuItem::element(move |window, cx| {
+                            let account = email.clone();
+                            let focus = focus_for_remove.clone();
+                            let remove = Rc::new(window.listener_for(
+                                &view_for_remove,
+                                move |_, _: &ClickEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    window.dispatch_action(Box::new(Cancel), cx);
+                                    let account = account.clone();
+                                    let focus = focus.clone();
+                                    cx.defer_in(window, move |app, window, cx| {
+                                        focus.focus(window, cx);
+                                        app.confirm_remove_account(account, window, cx);
+                                    });
+                                },
+                            ));
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(email.clone()),
+                                )
+                                .child(
+                                    Button::new(format!("remove-account-{email}"))
+                                        .ghost()
+                                        .small()
+                                        .compact()
+                                        .icon(gpui_kit::assets::IconName::Trash)
+                                        .accessibility_label(format!("移除账号 {email}"))
+                                        .tooltip("移除账号")
+                                        .disabled(busy)
+                                        .when(!busy, |button| {
+                                            button
+                                                .hover(|style| style.text_color(cx.theme().danger))
+                                        })
+                                        .on_click({
+                                            let remove = Rc::clone(&remove);
+                                            move |event, window, cx| remove(event, window, cx)
+                                        })
+                                        .on_action(move |_: &Confirm, window, cx| {
+                                            remove(&ClickEvent::default(), window, cx);
+                                        })
+                                        .on_action({
+                                            let focus = menu_focus.clone();
+                                            move |_: &SelectUp, window, cx| {
+                                                focus.focus(window, cx);
+                                                cx.propagate();
+                                            }
+                                        })
+                                        .on_action({
+                                            let focus = menu_focus.clone();
+                                            move |_: &SelectDown, window, cx| {
+                                                focus.focus(window, cx);
+                                                cx.propagate();
+                                            }
+                                        }),
+                                )
+                        })
+                        .checked(selected)
+                        .disabled(busy)
+                        .on_click(window.listener_for(
+                            &view,
+                            move |app, _, window, cx| {
                                 app.switch_account(email_for_select.clone(), window, cx);
-                            })),
+                            },
+                        )),
                     );
-                }
-                if !accounts.is_empty() {
-                    menu = menu.separator().label("移除账号");
-                    for email in &accounts {
-                        let account = email.clone();
-                        menu = menu.item(
-                            PopupMenuItem::new(format!("移除 {email}…"))
-                                .disabled(busy)
-                                .on_click(window.listener_for(&view, move |app, _, window, cx| {
-                                    app.confirm_remove_account(account.clone(), window, cx);
-                                })),
-                        );
-                    }
                 }
                 menu.separator().item(
                     PopupMenuItem::new("添加账号…")

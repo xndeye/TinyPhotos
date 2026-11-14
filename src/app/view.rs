@@ -189,7 +189,7 @@ fn format_size(bytes: u64) -> String {
 }
 
 impl Render for UploadApp {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let screen = self.screen();
         let body = match screen {
             Screen::Connect => self.authorize(cx).into_any_element(),
@@ -244,7 +244,7 @@ impl Render for UploadApp {
                                         .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation()
                                         })
-                                        .child(self.account_menu(cx)),
+                                        .child(self.account_menu(window, cx)),
                                 )
                             })
                             .child(
