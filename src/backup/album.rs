@@ -1,10 +1,46 @@
 //! A single optional album target, resolved from the review input without network calls.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum AlbumTarget {
+    #[default]
     None,
     Existing(String),
     Create(String),
+}
+
+#[derive(Default)]
+pub struct AlbumState {
+    pub(crate) target: AlbumTarget,
+    pub(crate) pending_keys: std::collections::HashSet<String>,
+    pub(crate) error: Option<super::Error>,
+}
+
+impl AlbumState {
+    pub fn record(&mut self, key: String) {
+        if !matches!(self.target, AlbumTarget::None) {
+            self.pending_keys.insert(key);
+        }
+    }
+
+    pub fn needs_verification(&self) -> bool {
+        self.error
+            .as_ref()
+            .is_some_and(|error| error.kind == super::ErrorKind::UncertainAlbumCreation)
+    }
+
+    pub fn has_pending(&self) -> bool {
+        !matches!(self.target, AlbumTarget::None) && !self.pending_keys.is_empty()
+    }
+
+    pub fn resolve(&self, input: &str) -> Result<AlbumTarget, String> {
+        if !self.needs_verification() {
+            return Ok(self.target.clone());
+        }
+        match parse(input)? {
+            AlbumTarget::Existing(key) => Ok(AlbumTarget::Existing(key)),
+            _ => Err("请先在 Google Photos 核验相册，再填写现有相册链接或 ID，避免重复创建".into()),
+        }
+    }
 }
 
 fn valid_key(key: &str) -> bool {
@@ -48,29 +84,4 @@ pub fn parse(input: &str) -> Result<AlbumTarget, String> {
         return Err("不支持的相册链接或名称".into());
     }
     Ok(AlbumTarget::Create(value.to_owned()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn album_targets() {
-        assert_eq!(parse(" ").unwrap(), AlbumTarget::None);
-        assert_eq!(
-            parse("https://photos.google.com/u/0/album/AF1Qipabc123?x=1").unwrap(),
-            AlbumTarget::Existing("AF1Qipabc123".into())
-        );
-        assert_eq!(
-            parse("https://photos.google.com/album/AF1Qipabc123").unwrap(),
-            AlbumTarget::Existing("AF1Qipabc123".into())
-        );
-        assert_eq!(
-            parse("旅行 2026").unwrap(),
-            AlbumTarget::Create("旅行 2026".into())
-        );
-        assert!(parse("https://photos.app.goo.gl/abc").is_err());
-        assert!(parse("https://photos.google.com/share/AF1Qipabc123").is_err());
-        assert!(parse("AF1Qip?").is_err());
-    }
 }

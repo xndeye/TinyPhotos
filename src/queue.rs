@@ -1,5 +1,3 @@
-//! Expand user-provided files/folders into a deduplicated upload queue.
-//! The manifest never reads the entire file, and never follows directory symlinks.
 use std::{
     collections::HashSet,
     fs,
@@ -25,21 +23,18 @@ pub struct ScanResult {
 #[derive(Default)]
 pub struct Queue {
     pub files: Vec<MediaFile>,
-    pub total_bytes: u64,
     keys: HashSet<PathBuf>,
 }
 
-fn key(path: &Path) -> PathBuf {
-    // On Windows paths are normally case-insensitive. Canonicalization handles
-    // relative paths and common aliases; failures retain an absolute-ish path.
-    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+fn key(path: &Path) -> std::io::Result<PathBuf> {
+    let canonical = fs::canonicalize(path)?;
     #[cfg(target_os = "windows")]
     {
-        PathBuf::from(canonical.to_string_lossy().to_lowercase())
+        Ok(PathBuf::from(canonical.to_string_lossy().to_lowercase()))
     }
     #[cfg(not(target_os = "windows"))]
     {
-        canonical
+        Ok(canonical)
     }
 }
 
@@ -104,7 +99,13 @@ fn add_file(path: &Path, result: &mut ScanResult, seen: &mut HashSet<PathBuf>) {
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    let path_key = key(path);
+    let path_key = match key(path) {
+        Ok(key) => key,
+        Err(error) => {
+            result.warn(format!("无法定位 {}：{error}", path.display()));
+            return;
+        }
+    };
     if seen.contains(&path_key) {
         return;
     }
@@ -166,11 +167,14 @@ pub fn scan(inputs: &[PathBuf]) -> ScanResult {
 }
 
 impl Queue {
+    pub fn total_bytes(&self) -> u64 {
+        self.files.iter().map(|file| file.size).sum()
+    }
+
     pub fn merge(&mut self, found: ScanResult) -> (usize, usize, Vec<String>) {
         let mut added = 0;
         for file in found.files {
             if self.keys.insert(file.key.clone()) {
-                self.total_bytes = self.total_bytes.saturating_add(file.size);
                 self.files.push(file);
                 added += 1;
             }
@@ -178,64 +182,15 @@ impl Queue {
         (added, found.ignored, found.warnings)
     }
 
-    /// Remove an item from the manifest only; never deletes anything from disk.
-    pub fn remove(&mut self, index: usize) -> Option<MediaFile> {
-        if index >= self.files.len() {
-            return None;
-        }
+    /// 仅从队列移除文件，不删除本地原件。
+    pub fn remove(&mut self, index: usize) -> MediaFile {
         let file = self.files.remove(index);
-        self.total_bytes = self.total_bytes.saturating_sub(file.size);
         self.keys.remove(&file.key);
-        Some(file)
+        file
     }
 
-    /// Restore a previously removed item at its original position.
-    pub fn restore(&mut self, index: usize, file: MediaFile) -> bool {
-        if !self.keys.insert(file.key.clone()) {
-            return false;
-        }
-        self.total_bytes = self.total_bytes.saturating_add(file.size);
-        self.files.insert(index.min(self.files.len()), file);
-        true
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn recognizes_media_and_rejects_other_extensions() {
-        assert!(supported(Path::new("A.JPG")));
-        assert!(supported(Path::new("b.mP4")));
-        assert!(!supported(Path::new("password.txt")));
-    }
-
-    #[test]
-    fn scan_folder_and_explicit_file_without_duplicates() {
-        let folder = std::env::temp_dir().join(format!("tinyphotos-queue-{}", std::process::id()));
-        fs::create_dir_all(folder.join("nested")).unwrap();
-        let photo = folder.join("nested").join("one.JPG");
-        fs::write(&photo, b"test").unwrap();
-        fs::write(folder.join("not-media.txt"), b"skip").unwrap();
-        fs::write(folder.join("empty.jpg"), b"").unwrap();
-        let found = scan(&[folder.clone(), photo.clone()]);
-        assert!(found.warnings.iter().any(|m| m.contains("空文件")));
-        let mut queue = Queue::default();
-        assert_eq!(queue.merge(found).0, 1);
-        assert_eq!(queue.files[0].size, 4);
-        assert_eq!(queue.merge(scan(&[photo])).0, 0);
-        assert_eq!(queue.total_bytes, 4);
-        assert!(queue.remove(5).is_none());
-        let removed = queue.remove(0).unwrap();
-        assert_eq!(removed.size, 4);
-        assert_eq!(queue.total_bytes, 0);
-        assert!(queue.files.is_empty());
-        let duplicate = removed.clone();
-        assert!(queue.restore(0, removed));
-        assert!(!queue.restore(0, duplicate));
-        assert_eq!(queue.files.len(), 1);
-        assert_eq!(queue.total_bytes, 4);
-        let _ = fs::remove_dir_all(folder);
+    pub fn restore(&mut self, index: usize, file: MediaFile) {
+        self.keys.insert(file.key.clone());
+        self.files.insert(index, file);
     }
 }

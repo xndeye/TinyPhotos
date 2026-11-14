@@ -1,32 +1,65 @@
 //! Credential lifecycle and account switching. Secrets stay in OS storage.
 use super::*;
 
+fn decode_credentials(email: &str, secret: &[u8]) -> Result<Credentials, backup::Error> {
+    let raw = std::str::from_utf8(secret).map_err(|error| {
+        backup::Error::new(
+            backup::ErrorKind::Authorization,
+            format!("保存的账号凭据格式无效：{error}"),
+        )
+    })?;
+    let credential = Credentials::parse(raw)?;
+    if accounts::normalized_email(&credential.email) != email {
+        return Err(backup::Error::new(
+            backup::ErrorKind::Authorization,
+            "系统凭据与账号索引不匹配",
+        ));
+    }
+    Ok(credential)
+}
+
+#[derive(Default, PartialEq, Eq)]
+pub(super) enum AccountOperation {
+    #[default]
+    Idle,
+    Loading,
+    Authorizing,
+}
+
+#[derive(Default)]
+pub(super) struct AccountState {
+    pub(super) credentials: Option<Credentials>,
+    pub(super) index: accounts::AccountIndex,
+    pub(super) operation: AccountOperation,
+    pub(super) auth_open: bool,
+    pub(super) show_auth_help: bool,
+    pub(super) auth_error: Option<backup::Error>,
+    pub(super) problem: Option<backup::Error>,
+}
+
 impl UploadApp {
-    pub(super) fn reset_account_context(&mut self) {
-        self.task = TaskState::Idle;
-        self.task_error = None;
-        self.show_details = false;
-        self.outcomes.clear();
-        self.errors.clear();
+    fn reset_account_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.backup = BackupTask::default();
+        self.queue_errors.clear();
         self.thumbnails.clear();
-        self.album_text.clear();
-        self.album_target = None;
-        self.album_error = None;
-        self.clear_album_input = true;
-        self.reset_progress();
+        self.album_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
     }
 
     pub(super) fn verify_saved_account(&mut self, cx: &mut Context<Self>) {
-        self.loading_account = true;
+        self.account.operation = AccountOperation::Loading;
         cx.spawn(async move |this, cx| {
             let initialized: Result<
-                (accounts::AccountIndex, Result<Option<Credentials>, String>),
-                String,
+                (
+                    accounts::AccountIndex,
+                    Result<Option<Credentials>, backup::Error>,
+                ),
+                backup::Error,
             > = async {
                 let index = cx
                     .background_spawn(async { accounts::AccountIndex::load() })
                     .await?;
-                let verified: Result<Option<Credentials>, String> = async {
+                let verified: Result<Option<Credentials>, backup::Error> = async {
                     let Some(email) = index.active.as_ref() else {
                         return Ok(None);
                     };
@@ -35,13 +68,13 @@ impl UploadApp {
                         .update(|app| app.read_credentials(&key))
                         .await
                         .map_err(|error| error.to_string())?
-                        .ok_or("当前账号的系统凭据不存在，请重新授权")?;
-                    let credential = String::from_utf8(secret)
-                        .map_err(|_| "保存的账号凭据格式无效，请重新授权".to_owned())
-                        .and_then(|raw| Credentials::parse(&raw))?;
-                    if accounts::normalized_email(&credential.email) != *email {
-                        return Err("系统凭据与账号索引不匹配".into());
-                    }
+                        .ok_or_else(|| {
+                            backup::Error::new(
+                                backup::ErrorKind::Authorization,
+                                "当前账号的系统凭据不存在，请重新授权",
+                            )
+                        })?;
+                    let credential = decode_credentials(email, &secret)?;
                     cx.background_spawn(async move { backup::verify_account(credential) })
                         .await
                         .map(Some)
@@ -51,21 +84,21 @@ impl UploadApp {
             }
             .await;
             let _ = this.update(cx, |app, cx| {
-                app.loading_account = false;
+                app.account.operation = AccountOperation::Idle;
                 match initialized {
                     Ok((index, Ok(credential))) => {
-                        app.accounts = index;
-                        app.credentials = credential;
-                        app.problem = None;
+                        app.account.index = index;
+                        app.account.credentials = credential;
+                        app.account.problem = None;
                     }
                     Ok((index, Err(error))) => {
-                        app.accounts = index; // Still allow choosing a different saved account.
-                        app.credentials = None;
-                        app.problem = Some(classify_problem(error));
+                        app.account.index = index; // Still allow choosing a different saved account.
+                        app.account.credentials = None;
+                        app.account.problem = Some(error);
                     }
                     Err(error) => {
-                        app.credentials = None;
-                        app.problem = Some(classify_problem(error));
+                        app.account.credentials = None;
+                        app.account.problem = Some(error);
                     }
                 }
                 cx.notify();
@@ -74,31 +107,39 @@ impl UploadApp {
         .detach();
     }
 
-    pub(super) fn switch_account(&mut self, email: String, cx: &mut Context<Self>) {
-        if self.busy() || !self.accounts.emails.contains(&email) {
+    pub(super) fn switch_account(
+        &mut self,
+        email: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy() {
             return;
         }
-        if self.accounts.active.as_deref() == Some(&email) && self.credentials.is_some() {
+        if self.account.index.active.as_deref() == Some(&email)
+            && self.account.credentials.is_some()
+        {
             return;
         }
-        self.loading_account = true;
+        self.account.operation = AccountOperation::Loading;
         self.notice = "正在切换账号…".into();
-        let mut next = self.accounts.clone();
+        let mut next = self.account.index.clone();
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result: Result<(accounts::AccountIndex, Credentials), String> = async {
+        cx.spawn_in(window, async move |this, cx| {
+            let result: Result<(accounts::AccountIndex, Credentials), backup::Error> = async {
                 let key = accounts::credential_key(&email);
                 let (_, secret) = cx
-                    .update(|app| app.read_credentials(&key))
+                    .update(|_, app| app.read_credentials(&key))
+                    .map_err(|error| error.to_string())?
                     .await
                     .map_err(|error| error.to_string())?
-                    .ok_or("该账号的系统凭据不存在，请重新添加")?;
-                let credential = String::from_utf8(secret)
-                    .map_err(|_| "保存的账号凭据格式无效".to_owned())
-                    .and_then(|raw| Credentials::parse(&raw))?;
-                if accounts::normalized_email(&credential.email) != email {
-                    return Err("账号和保存的凭据不匹配".into());
-                }
+                    .ok_or_else(|| {
+                        backup::Error::new(
+                            backup::ErrorKind::Authorization,
+                            "该账号的系统凭据不存在，请重新添加",
+                        )
+                    })?;
+                let credential = decode_credentials(&email, &secret)?;
                 let credential = cx
                     .background_spawn(async move { backup::verify_account(credential) })
                     .await?;
@@ -108,14 +149,14 @@ impl UploadApp {
                 Ok((next, credential))
             }
             .await;
-            let _ = this.update(cx, |app, cx| {
-                app.loading_account = false;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.account.operation = AccountOperation::Idle;
                 match result {
                     Ok((index, credential)) => {
-                        app.reset_account_context();
-                        app.accounts = index;
-                        app.credentials = Some(credential);
-                        app.problem = None;
+                        app.reset_account_context(window, cx);
+                        app.account.index = index;
+                        app.account.credentials = Some(credential);
+                        app.account.problem = None;
                         app.notice = "已切换账号，本地待备份文件未改变".into();
                     }
                     Err(error) => app.notice = format!("切换账号失败：{error}"),
@@ -132,7 +173,7 @@ impl UploadApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.busy() || !self.accounts.emails.contains(&email) {
+        if self.busy() {
             return;
         }
         let view = cx.entity();
@@ -148,46 +189,54 @@ impl UploadApp {
                 .ok_text("移除账号")
                 .ok_variant(ButtonVariant::Danger)
                 .cancel_text("取消")
-                .on_ok(move |_, _, cx| {
-                    view.update(cx, |app, cx| app.remove_account(account.clone(), cx));
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |app, cx| app.remove_account(account.clone(), window, cx));
                     true
                 })
         });
     }
 
-    fn remove_account(&mut self, email: String, cx: &mut Context<Self>) {
-        if self.busy() || !self.accounts.emails.contains(&email) {
+    fn remove_account(&mut self, email: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() {
             return;
         }
-        self.loading_account = true;
-        let original = self.accounts.clone();
+        self.account.operation = AccountOperation::Loading;
+        let original = self.account.index.clone();
         let was_active = original.active.as_deref() == Some(email.as_str());
         let mut next = original.clone();
         next.remove(&email);
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result: Result<accounts::AccountIndex, String> = async {
+        cx.spawn_in(window, async move |this, cx| {
+            let result: Result<accounts::AccountIndex, backup::Error> = async {
                 let saved = next.clone();
                 cx.background_spawn(async move { saved.save() }).await?;
                 let key = accounts::credential_key(&email);
-                if let Err(error) = cx.update(|app| app.delete_credentials(&key)).await {
-                    let _ = cx.background_spawn(async move { original.save() }).await;
-                    return Err(format!("无法删除账号凭据：{error}"));
+                if let Err(error) = cx
+                    .update(|_, app| app.delete_credentials(&key))
+                    .map_err(|error| error.to_string())?
+                    .await
+                {
+                    cx.background_spawn(async move { original.save() })
+                        .await
+                        .map_err(|restore| {
+                            format!("无法删除账号凭据：{error}；恢复账号索引失败：{restore}")
+                        })?;
+                    return Err(format!("无法删除账号凭据：{error}").into());
                 }
                 Ok(next)
             }
             .await;
-            let _ = this.update(cx, |app, cx| {
-                app.loading_account = false;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.account.operation = AccountOperation::Idle;
                 match result {
                     Ok(index) => {
-                        app.accounts = index;
+                        app.account.index = index;
                         if was_active {
-                            app.credentials = None;
-                            app.problem = None;
-                            app.auth_open = false;
-                            app.reset_account_context();
-                            if app.accounts.active.is_some() {
+                            app.account.credentials = None;
+                            app.account.problem = None;
+                            app.account.auth_open = false;
+                            app.reset_account_context(window, cx);
+                            if app.account.index.active.is_some() {
                                 app.verify_saved_account(cx);
                             }
                         }
@@ -199,5 +248,158 @@ impl UploadApp {
             });
         })
         .detach();
+    }
+    pub(super) fn import_account_hotkey(
+        &mut self,
+        _: &ImportAccount,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_auth(window, cx);
+    }
+
+    pub(super) fn open_auth(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
+        self.account.auth_open = true;
+        self.account.show_auth_help = false;
+        self.account.auth_error = None;
+        if self.backup.state != TaskState::Done {
+            self.account.problem = None;
+        }
+        self.token_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.notice.clear();
+        cx.notify();
+        let focus = self.token_input.focus_handle(cx);
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+    }
+
+    pub(super) fn back_from_auth(
+        &mut self,
+        _: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.account.operation == AccountOperation::Authorizing {
+            return;
+        }
+        self.account.auth_open = false;
+        if self.backup.state != TaskState::Done {
+            self.account.problem = None;
+        }
+        self.account.auth_error = None;
+        self.token_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.notice.clear();
+        cx.notify();
+        self.focus.focus(window, cx);
+    }
+
+    pub(super) fn open_google(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        cx.open_url("https://accounts.google.com/EmbeddedSetup");
+    }
+
+    pub(super) fn toggle_auth_help(
+        &mut self,
+        _: &ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.account.show_auth_help = !self.account.show_auth_help;
+        cx.notify();
+    }
+
+    pub(super) fn complete_auth(
+        &mut self,
+        _: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_auth(window, cx);
+    }
+
+    pub(super) fn begin_auth(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
+        let token = self.token_input.read(cx).value().to_string();
+        let index = self.account.index.clone();
+        self.account.auth_error = None;
+        self.account.operation = AccountOperation::Authorizing;
+        self.notice = "正在验证 Google 授权…".into();
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    backup::exchange_embedded(&token).and_then(backup::verify_account)
+                })
+                .await;
+            let result: Result<(Credentials, accounts::AccountIndex), backup::Error> = async {
+                let credential = result?;
+                let key = accounts::credential_key(&credential.email);
+                let serialized = credential.serialized();
+                cx.update(|_, app| {
+                    app.write_credentials(&key, &credential.email, serialized.as_bytes())
+                })
+                .map_err(|error| error.to_string())?
+                .await
+                .map_err(|e| format!("账号已验证，但系统凭据存储失败：{e}"))?;
+                let mut next = index;
+                next.add(&credential.email);
+                let saved = next.clone();
+                cx.background_spawn(async move { saved.save() })
+                    .await
+                    .map_err(|e| format!("无法保存账号索引：{e}"))?;
+                Ok((credential, next))
+            }
+            .await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.account.operation = AccountOperation::Idle;
+                match result {
+                    Ok((credential, index)) => {
+                        let changed = app.account.credentials.as_ref().is_none_or(|previous| {
+                            accounts::normalized_email(&previous.email)
+                                != accounts::normalized_email(&credential.email)
+                        });
+                        if changed {
+                            app.reset_account_context(window, cx);
+                        }
+                        app.account.index = index;
+                        app.account.credentials = Some(credential);
+                        app.account.auth_open = false;
+                        app.token_input
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        app.account.problem = None;
+                        app.notice = "账号已连接".into();
+                    }
+                    Err(error) => {
+                        app.account.auth_error = Some(error);
+                        app.notice.clear();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn retry_problem(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
+        self.account.problem = None;
+        self.verify_saved_account(cx);
+        cx.notify();
+    }
+
+    pub(super) fn reauthorize(
+        &mut self,
+        _: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_auth(window, cx);
     }
 }
